@@ -11,7 +11,7 @@
     "kaiby-link": "bin/kaiby-link.cjs"
   },
   "scripts": {
-    "test": "node --test test/*.test.cjs",
+    "test": "node --test",
     "start": "node bin/kaiby-link.cjs"
   },
   "dependencies": {
