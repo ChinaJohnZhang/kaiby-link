@@ -1,4 +1,4 @@
-name: Verify basic installers
+name: Verify basic portable packages
 on:
   release:
     types: [published]
@@ -23,7 +23,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - name: Install, start, reuse and exit the downloaded basic package
+      - name: Extract, start, reuse and exit the downloaded basic package
         env:
           RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
           GITHUB_TOKEN: ${{ github.token }}
