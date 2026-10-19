@@ -2,6 +2,7 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 const { EventEmitter } = require('node:events');
 const { setTimeout: delay } = require('node:timers/promises');
@@ -114,7 +115,8 @@ class DesktopConnection extends EventEmitter {
     this.source = sourceOf(options.metadata, this.env);
     this.ready = !!(this.source && this.env.CODEX_APP_TOOLS_PIPE_PATH && (this.env.CODEX_MCP_NODE_PATH || this.env.CODEX_BROWSER_USE_NODE_PATH));
     this.unavailableReason = !this.source ? '请先从 Codex 中启用连接器插件，尚未取得真实会话调用来源。' : !this.ready ? '连接器尚未接入 Codex 插件宿主，请在 Codex 中启用。' : null;
-    this.connected = false; this.sequence = 0; this.pending = new Map(); this.destinations = new Map(); this.turnReserved = false; this.unknownSubmission = null;
+    this.connected = false; this.sequence = 0; this.pending = new Map(); this.destinations = new Map(); this.turnReserved = false;
+    this.unknownSubmission = null; this.unknownSubmissions = new Map();
   }
   async connect() {
     if (this.connected) return;
@@ -214,10 +216,15 @@ class DesktopConnection extends EventEmitter {
     if (reply == null) throw failure('指定输入之后尚无可确认的最终回复，请在 Codex 中核对。');
     return reply;
   }
-  async runTurn(threadId, text, onAccepted = () => {}) {
-    if (this.unknownSubmission) throw failure('上次提交结果尚未确认，请回电脑端核对；不会再次提交。', true);
-    if (this.turnReserved) throw failure('当前正在处理一条消息，请完成后再发送。');
+  async runTurn(threadId, text, onAccepted = () => {}, { requestId } = {}) {
     if (typeof text !== 'string' || !text.trim() || text.length > 16000) throw failure('请发送不超过 16000 字的文字消息。');
+    if (requestId != null && (typeof requestId !== 'string' || !requestId || requestId.length > 512)) throw failure('消息 ID 无效。');
+    // Real inbound IDs isolate retries even when two messages have identical
+    // text. Direct callers without an ID conservatively identify the same
+    // request by destination + full text, never by the whole destination alone.
+    const submissionKey = crypto.createHash('sha256').update(JSON.stringify(requestId == null ? ['text', threadId, text] : ['request', requestId])).digest('hex');
+    if (this.unknownSubmissions.has(submissionKey)) throw failure('这条消息已经提交，不会重复发送；你可以继续发送新消息。', true);
+    if (this.turnReserved) throw failure('当前正在处理一条消息，请完成后再发送。');
     this.turnReserved = true;
     let dispatched = false;
     const controller = new AbortController(); this.activeController = controller;
@@ -259,7 +266,11 @@ class DesktopConnection extends EventEmitter {
       throw failure('等待本轮回复超时，请回 Codex 核对；不会自动重发。', true);
     } catch (error) {
       const result = error?.name === 'AbortError' ? failure('Codex 桌面连接已停止，请回电脑核对本轮结果。') : error instanceof Error ? error : failure('本轮结果无法确认，请回电脑核对。');
-      if (dispatched) { result.unknown = true; this.unknownSubmission = { threadId }; }
+      if (dispatched) {
+        result.unknown = true;
+        this.unknownSubmission = { threadId, submissionKey, ...(requestId == null ? {} : { requestId }) };
+        this.unknownSubmissions.set(submissionKey, this.unknownSubmission);
+      }
       throw result;
     } finally { if (this.activeController === controller) this.activeController = null; this.turnReserved = false; }
   }

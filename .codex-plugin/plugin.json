@@ -1,8 +1,11 @@
 {
   "name": "kaiby-link",
   "version": "0.1.0",
-  "description": "开摆连接器开源版：命令行扫码，手动固定一个已有会话，仅转发文字。",
-  "author": { "name": "开摆AI", "url": "https://kaibyai.com" },
+  "description": "扫码连接 Codex，在手机上继续桌面会话并接收回复。",
+  "author": {
+    "name": "开摆AI",
+    "url": "https://kaibyai.com"
+  },
   "license": "MIT",
   "mcpServers": "./.mcp.json",
   "requires_local_executor": true

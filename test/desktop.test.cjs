@@ -160,6 +160,77 @@ test('disconnect and timeout after a send remain unknown and never replay the mu
   }
 });
 
+test('an unknown request without an inbound ID blocks only the same destination and text', async () => {
+  const { connection } = fixture([history()]);
+  const sends = [];
+  connection._tool = async (name, args) => {
+    if (name === 'send_message_to_thread') {
+      sends.push(args.threadId);
+      if (args.threadId === 'thread-1') throw new Error('unconfirmed first submission');
+      return {};
+    }
+    const turns = args.threadId === 'thread-2' && sends.includes('thread-2')
+      ? [turn('second-turn', [delegation(), publicFinal('第二条会话的回复')])] : [];
+    return history(turns, { thread: { id: args.threadId, status: 'idle' } });
+  };
+  await assert.rejects(connection.runTurn('thread-1', 'hello'), error => error.unknown === true);
+  assert.equal(await connection.runTurn('thread-2', 'hello'), '第二条会话的回复');
+  await assert.rejects(connection.runTurn('thread-1', 'hello'), error => error.unknown === true);
+  assert.deepEqual(sends, ['thread-1', 'thread-2']);
+  assert.deepEqual([...connection.unknownSubmissions.values()].map(entry => entry.threadId), ['thread-1']);
+});
+
+test('multiple unknown requests stay deduplicated after switching and reconnecting', async () => {
+  const { connection } = fixture([history()]);
+  const sends = [];
+  connection._tool = async (name, args) => {
+    if (name === 'send_message_to_thread') { sends.push(args.threadId); throw new Error('unconfirmed submission'); }
+    return history([], { thread: { id: args.threadId, status: 'idle' } });
+  };
+  for (const id of ['thread-1', 'thread-2']) await assert.rejects(connection.runTurn(id, 'hello'), error => error.unknown === true);
+  connection.close(); connection.connected = true;
+  for (const id of ['thread-1', 'thread-2']) await assert.rejects(connection.runTurn(id, 'hello'), error => error.unknown === true);
+  assert.deepEqual(sends, ['thread-1', 'thread-2']);
+  assert.deepEqual([...connection.unknownSubmissions.values()].map(entry => entry.threadId), ['thread-1', 'thread-2']);
+});
+
+test('a new inbound ID can continue on the same thread while the original unknown ID stays blocked', async () => {
+  const { connection } = fixture([history()]);
+  const turns = []; let sends = 0;
+  connection._tool = async (name, args) => {
+    if (name === 'read_thread') return history([...turns]);
+    sends++;
+    if (sends === 1) {
+      turns.push(turn('old-turn', [delegation(args.prompt, 'old-input')], 'completed'));
+      throw new Error('first send receipt was lost');
+    }
+    turns.push(turn('new-turn', [delegation(args.prompt, 'new-input'), publicFinal('new inbound reply', 'new-final')]));
+    return {};
+  };
+  await assert.rejects(connection.runTurn('thread-1', 'hello', undefined, { requestId: 'mobile-1' }), error => error.unknown === true);
+  await assert.rejects(connection.runTurn('thread-1', 'hello', undefined, { requestId: 'mobile-1' }), error => error.unknown === true);
+  assert.equal(await connection.runTurn('thread-1', 'hello', undefined, { requestId: 'mobile-2' }), 'new inbound reply');
+  await assert.rejects(connection.runTurn('thread-2', 'changed text', undefined, { requestId: 'mobile-1' }), error => error.unknown === true);
+  assert.equal(sends, 2);
+  assert.deepEqual([...connection.unknownSubmissions.values()].map(entry => entry.requestId), ['mobile-1']);
+});
+
+test('direct callers can send distinct text on the same thread after an unknown result', async () => {
+  const { connection } = fixture([history()]); let sends = 0;
+  const turns = [];
+  connection._tool = async (name, args) => {
+    if (name === 'read_thread') return history([...turns]);
+    sends++;
+    if (sends === 1) throw new Error('lost receipt');
+    turns.push(turn('next-turn', [delegation(args.prompt, 'next-input'), publicFinal('continued', 'next-final')]));
+    return {};
+  };
+  await assert.rejects(connection.runTurn('thread-1', 'hello'), error => error.unknown === true);
+  await assert.rejects(connection.runTurn('thread-1', 'hello'), error => error.unknown === true);
+  assert.equal(await connection.runTurn('thread-1', 'continue'), 'continued');
+  assert.equal(sends, 2);
+});
+
 test('failed durable acceptance callbacks and missing matching inputs remain unknown', async () => {
   const { connection } = fixture([history(), history([turn('ours', [user(), publicFinal('answer')])])]);
   await assert.rejects(connection.runTurn('thread-1', 'hello', () => { throw Error('disk full'); }), error => error.unknown === true);
@@ -232,9 +303,12 @@ test('an already existing delegation item cannot identify a newly submitted mess
 
 test('explicit completed-turn recovery is read-only and leaves unknown submissions blocked', async () => {
   const { connection, calls } = fixture([history([turn('known-completed-turn', [delegation(), publicFinal('recovered final')])])]);
-  connection.unknownSubmission = { threadId: 'thread-1' };
+  const original = connection._tool;
+  connection._tool = async (name, args) => { if (name === 'send_message_to_thread') throw Error('lost receipt'); return original(name, args); };
+  await assert.rejects(connection.runTurn('thread-1', 'hello'), error => error.unknown === true);
+  const before = [...connection.unknownSubmissions.entries()];
   assert.equal(await connection.recoverTurn('thread-1', 'known-completed-turn', 'hello'), 'recovered final');
-  assert.deepEqual(connection.unknownSubmission, { threadId: 'thread-1' });
+  assert.deepEqual([...connection.unknownSubmissions.entries()], before);
   assert.equal(calls.some(call => call.name === 'send_message_to_thread'), false);
   await assert.rejects(connection.runTurn('thread-1', 'hello'), error => error.unknown === true);
   await assert.rejects(connection.recoverTurn('thread-1', 'known-completed-turn', 'different input'), /不匹配/);

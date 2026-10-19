@@ -72,6 +72,37 @@ function checkWindowsNativeHelper(resources, temp, env) {
     fs.closeSync(fd); fs.rmSync(directory, { recursive: true, force: true });
   }
 }
+function checkPortableResources(resources) {
+  const extension = path.join(resources, 'marketplace', 'extension');
+  for (const name of ['app.cjs', 'discovery-windows.ps1', 'public/index.html', 'public/style.css', 'public/app.js',
+    'public/brand/kaiby-ai.svg', 'public/brand/kaibyx.svg', 'public/brand/zaowu.svg']) {
+    const original = fs.readFileSync(path.join(resources, name));
+    assert.deepEqual(fs.readFileSync(path.join(extension, name)), original, 'Desktop extension resource differs: ' + name);
+    if (name.endsWith('.svg')) assert.match(original.toString('utf8'), /<svg(?:\s|>)/, 'Invalid brand SVG: ' + name);
+  }
+  const bundle = fs.readFileSync(path.join(resources, 'app.cjs'), 'utf8');
+  // Packaging checks confirm the media/queue implementation is linked into
+  // both entry points. Account-free media behavior has separate local fixtures;
+  // finding these methods is not a claim of successful real-world delivery.
+  for (const method of ['materializeMessage', 'sendImageOwner', 'sendVideoOwner', 'sendFileOwner', 'prepareQueuedMessage']) {
+    assert.match(bundle, new RegExp('\\b' + method + '\\s*\\('), 'Missing bundled feature: ' + method);
+  }
+  assert.match(fs.readFileSync(path.join(resources, 'AGENTS.md'), 'utf8'), /给 AI 的部署说明/);
+  const instructions = fs.readFileSync(path.join(resources, '使用说明.txt'), 'utf8');
+  assert.match(instructions, /连发消息会按顺序处理/);
+  assert.match(instructions, /图片、视频直接查看/);
+  assert.match(instructions, /普通文件作为附件收发/);
+  assert.doesNotMatch(instructions, /仅支持[^\n]*文字收发/);
+}
+async function checkWebResources(origin, resources) {
+  for (const name of ['style.css', 'app.js', 'brand/kaiby-ai.svg', 'brand/kaibyx.svg', 'brand/zaowu.svg']) {
+    const response = await fetch(origin + '/' + name);
+    assert.equal(response.status, 200, 'Missing web resource: ' + name);
+    if (name.endsWith('.svg')) assert.match(response.headers.get('content-type') || '', /^image\/svg\+xml(?:;|$)/);
+    const actual = Buffer.from(await response.arrayBuffer());
+    assert.deepEqual(actual, fs.readFileSync(path.join(resources, 'public', name)), 'Web resource differs: ' + name);
+  }
+}
 async function checkDesktopExtension(resources, runtime, env, version) {
   const root = path.join(resources, 'marketplace', 'extension');
   const marketplace = JSON.parse(fs.readFileSync(path.join(resources, 'marketplace', '.agents', 'plugins', 'marketplace.json')));
@@ -134,6 +165,7 @@ async function main() {
     const runtime = path.join(resources, 'runtime', process.platform === 'win32' ? 'node.exe' : 'node');
     const script = path.join(resources, 'app.cjs');
     assert.ok(fs.existsSync(script)); assert.ok(fs.existsSync(path.join(resources, 'NODE-LICENSE.txt')));
+    checkPortableResources(resources);
     const data = path.join(temp, 'data');
     const env = { ...process.env, KAIBY_LINK_DATA_DIR: data };
     for(const key of ['CODEX_APP_TOOLS_PIPE_PATH','CODEX_MCP_NODE_PATH','CODEX_BROWSER_USE_NODE_PATH','CODEX_ELECTRON_RESOURCES_PATH','CODEX_CLI_PATH','CODEX_HOME','CODEX_THREAD_ID','CODEX_APP_TOOLS_CALLER_HOST_ID']) delete env[key];
@@ -147,8 +179,11 @@ async function main() {
     const state = await (await fetch(url.origin + '/api/state', { headers })).json();
     assert.equal(state.instanceId, original.instanceId); assert.equal(state.channel.authenticated, false); assert.equal(state.running, false);
     assert.equal(state.codex.ready,false); assert.equal(state.codex.source,'desktop');
+    assert.equal(state.queuedCount, 0); assert.equal(state.pendingSelection, null);
     assert.equal((await fetch(url.origin + '/api/state')).status, 401);
     const page = await (await fetch(url.origin)).text(); assert.ok(page.includes('开摆连接器')); assert.ok(page.includes('kaibyai.com'));
+    assert.ok(page.includes('图片、视频和文件')); assert.ok(page.includes('/brand/kaiby-ai.svg'));
+    await checkWebResources(url.origin, resources);
     second = spawn(runtime, [script, '--no-open'], { env, stdio: 'ignore', windowsHide: true });
     assert.equal(await waitForExit(second), 0, 'Second launch failed');
     assert.equal(JSON.parse(fs.readFileSync(metadataFile, 'utf8')).instanceId, original.instanceId);
@@ -156,11 +191,11 @@ async function main() {
     await waitForExit(child, 8000);
     assert.equal(fs.existsSync(metadataFile), false);
     assert.equal(fs.existsSync(path.join(data, '基础版启动.lock')), false);
-    console.log('Verified portable ZIP hash, extraction, ' + (process.platform === 'win32' ? 'native Windows handle helper fixture, ' : '') + 'extension launcher/MCP protocol, runtime startup, local UI, access control, single instance and shutdown on ' + process.platform + '/' + process.arch + '. No actual desktop, account or model requests.');
+    console.log('Verified portable ZIP hash, extraction, brand assets and media module packaging, ' + (process.platform === 'win32' ? 'native Windows handle helper fixture, ' : '') + 'extension launcher/MCP protocol, runtime startup, queue state, local UI/resources, access control, single instance and shutdown on ' + process.platform + '/' + process.arch + '. No actual desktop, account, media delivery or model requests.');
   } finally {
     await stopChild(second); await stopChild(child);
     fs.rmSync(temp, { recursive: true, force: true });
   }
 }
 if (require.main === module) main().catch(() => { console.error('Basic portable package smoke test failed; inspect the failed stage without printing local credentials.'); process.exitCode = 1; });
-module.exports = { extensionLaunch, waitForExit, stopChild, checkDesktopExtension, windowsNativeProbeCommand };
+module.exports = { extensionLaunch, waitForExit, stopChild, checkDesktopExtension, windowsNativeProbeCommand, checkPortableResources, checkWebResources };

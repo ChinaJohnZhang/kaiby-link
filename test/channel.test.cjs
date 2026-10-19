@@ -4,7 +4,9 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { EventEmitter } = require('node:events');
 const { Channel, WeixinProbe, parseJsonSafe, apiOrigin, defaultDataDirectory } = require('../src/channel.cjs');
+const { Link } = require('../src/link.cjs');
 
 const response = data => ({ ok: true, text: async () => JSON.stringify(data) });
 const auth = { token: 'test-token', owner: 'test-owner', bot: 'test-bot', base: 'https://ilinkai.weixin.qq.com' };
@@ -66,13 +68,82 @@ test('only owner direct text messages are queued; duplicate, group, wrong bot, i
   assert.equal(channel.state().cursor, 'cursor-1');
 });
 
-test('queue saturation rolls back the entire batch including the cursor', t => {
+test('a partial batch keeps its old cursor and resumes the remaining message without duplicating admitted IDs', t => {
   const channel = setup(t);
-  channel.ingest({ msgs: Array.from({ length: 29 }, (_, i) => message(String(i + 1))), get_updates_buf: 'before' });
-  assert.throws(() => channel.ingest({ msgs: [message('30'), message('31')], get_updates_buf: 'after' }), /待处理消息已满/);
-  assert.equal(channel.inbox().length, 29);
+  channel.ingest({ msgs: [], get_updates_buf: 'before' });
+  const batch = { msgs: Array.from({ length: 31 }, (_, i) => message(String(i + 1))), get_updates_buf: 'after' };
+  assert.deepEqual(channel.ingest(batch), { received: 30, pending: 30, backpressure: true });
+  assert.deepEqual(channel.inbox().map(row => row.id), Array.from({ length: 30 }, (_, i) => String(i + 1)));
   assert.equal(channel.state().cursor, 'before');
+  assert.deepEqual(channel.ingest(batch), { received: 0, pending: 30, backpressure: true });
+  assert.equal(channel.state().cursor, 'before');
+  channel.markHandled('1');
+  assert.deepEqual(channel.ingest(batch), { received: 1, pending: 30 });
+  assert.equal(channel.state().cursor, 'after');
+  assert.equal(channel.state().messages.length, 31);
+  assert.deepEqual([...channel.state().messages.map(row => row.id)].sort((a, b) => Number(a) - Number(b)), Array.from({ length: 31 }, (_, i) => String(i + 1)));
+  assert.equal(channel.state().messages.find(row => row.id === '1').status, 'handled');
   assert.equal(fs.existsSync(path.join(channel.directory, '收发.lock')), false);
+});
+
+test('unknown history remains unchanged and consumes no active queue capacity', t => {
+  const channel = setup(t);
+  channel.ingest({ msgs: Array.from({ length: 30 }, (_, i) => message('unknown-' + i)), get_updates_buf: 'before' });
+  channel.update(state => { for (const row of state.messages) row.status = 'unknown'; state.seen = []; });
+  const history = channel.state().messages;
+  const batch = { msgs: [message('unknown-0'), ...Array.from({ length: 31 }, (_, i) => message('new-' + i))], get_updates_buf: 'after' };
+  assert.deepEqual(channel.ingest(batch), { received: 30, pending: 30, backpressure: true });
+  assert.equal(channel.state().cursor, 'before');
+  assert.deepEqual(channel.state().messages.filter(row => row.status === 'unknown'), history);
+  assert.equal(channel.state().messages.filter(row => row.id === 'unknown-0').length, 1);
+  assert.equal(channel.inbox().length, 30);
+});
+
+test('queued and processing rows both reserve active queue capacity', t => {
+  const channel = setup(t);
+  channel.ingest({ msgs: Array.from({ length: 30 }, (_, i) => message(String(i + 1))), get_updates_buf: 'before' });
+  channel.update(state => { state.messages.forEach((row, index) => { row.status = index % 2 ? 'queued' : 'processing'; }); });
+  assert.deepEqual(channel.ingest({ msgs: [message('31')], get_updates_buf: 'after' }), { received: 0, pending: 0, backpressure: true });
+  assert.equal(channel.state().cursor, 'before');
+  assert.equal(channel.state().messages.length, 30);
+});
+
+test('backpressure preserves every seen ID until its cursor batch has been completely admitted', t => {
+  const channel = setup(t);
+  channel.update(state => { state.seen = Array.from({ length: 2000 }, (_, i) => 'prior-' + i); });
+  const batch = { msgs: Array.from({ length: 31 }, (_, i) => message(String(i + 1))), get_updates_buf: 'after' };
+  assert.equal(channel.ingest(batch).backpressure, true);
+  assert.equal(channel.state().seen.length, 2030);
+  channel.markHandled('1');
+  assert.equal(channel.ingest(batch).received, 1);
+  assert.equal(channel.state().seen.length, 2000);
+  assert.equal(channel.state().cursor, 'after');
+});
+
+test('repeated backpressure polls keep the receive loop running without model work or cursor loss', async t => {
+  let polls = 0, release;
+  const fourthPoll = new Promise(resolve => { release = resolve; });
+  const batch = { msgs: Array.from({ length: 31 }, (_, i) => message(String(i + 1))), get_updates_buf: 'after' };
+  const channel = setup(t, async (_url, options) => {
+    assert.equal(JSON.parse(options.body).get_updates_buf, 'before');
+    if (++polls === 4) setImmediate(release);
+    return response(batch);
+  });
+  channel.ingest({ msgs: [], get_updates_buf: 'before' });
+  const connection = new EventEmitter();
+  connection.connected = true; connection.connect = async () => {}; connection.close = () => {};
+  connection.runTurn = async () => { throw new Error('No model work is allowed in this fixture'); };
+  const link = new Link({ channel, connection });
+  link.selected = { id: 'fixture-thread', title: 'Fixture chat' };
+  // Leave the bounded queue full to exercise repeated polling under pressure.
+  link.handle = async () => {};
+  await link.start();
+  try {
+    await fourthPoll;
+    assert.equal(polls, 4); assert.equal(link.running, true); assert.equal(link.error, null);
+    assert.equal(channel.state().cursor, 'before');
+    assert.equal(channel.state().messages.length, 30);
+  } finally { await link.stop(); }
 });
 
 test('state lock refuses concurrent writers without changing state', t => {
