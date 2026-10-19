@@ -1,0 +1,21 @@
+{
+  "name": "kaiby-link",
+  "version": "0.1.0",
+  "description": "开摆连接器：固定一个 Codex 会话的轻量命令行连接器",
+  "license": "MIT",
+  "private": true,
+  "engines": {
+    "node": ">=20.19"
+  },
+  "bin": {
+    "kaiby-link": "bin/kaiby-link.cjs"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.cjs",
+    "start": "node bin/kaiby-link.cjs"
+  },
+  "dependencies": {
+    "qrcode-generator": "2.0.4",
+    "ws": "8.22.0"
+  }
+}

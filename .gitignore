@@ -1,0 +1,12 @@
+node_modules/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!config.example.json
+private/
+state/
+认证.json
+收发.json
+登录中.json
