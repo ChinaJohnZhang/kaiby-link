@@ -4,6 +4,8 @@
 
 [开摆AI官网](https://kaibyai.com) · [基础版免安装包](https://github.com/ChinaJohnZhang/kaiby-link/releases)
 
+把项目交给 AI 协助部署时，请让它读取 [AGENTS.md](AGENTS.md)。该说明要求 AI 自动识别环境、完成安装与真实收发验证；用户只负责扫码和选择会话。
+
 这个公开仓库提供 MIT 许可的**开源命令行版**。带本机浏览器配置页面的**基础版**只在 Releases 分发免安装 ZIP，界面和增强模块不属于本仓库的开源许可。开摆X的完整集成功能单独提供。
 
 ## 当前兼容范围
