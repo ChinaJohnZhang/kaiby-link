@@ -149,6 +149,7 @@ function checkPortableResources(resources) {
     if (name.endsWith('.svg')) assert.match(original.toString('utf8'), /<svg(?:\s|>)/, 'Invalid brand SVG: ' + name);
   }
   const bundle = fs.readFileSync(path.join(resources, 'app.cjs'), 'utf8');
+  assert.doesNotMatch(bundle, /收到，正在交给 Codex，可继续补充。/, 'Fixed receipt template must not replace AI responses');
   // Packaging checks confirm the media/queue implementation is linked into
   // both entry points. Account-free media behavior has separate local fixtures;
   // finding these methods is not a claim of successful real-world delivery.
