@@ -1,7 +1,0 @@
-#!/bin/sh
-set -eu
-if [ -z "${CODEX_MCP_NODE_PATH:-}" ] || [ ! -x "$CODEX_MCP_NODE_PATH" ]; then
-  printf '%s\n' '请由提供本地工具的 Codex 桌面加载此 MCP 扩展。' >&2
-  exit 1
-fi
-exec "$CODEX_MCP_NODE_PATH" "$(dirname "$0")/kaiby-link-mcp.cjs"

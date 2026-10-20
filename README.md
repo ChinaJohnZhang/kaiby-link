@@ -51,9 +51,9 @@
 
 ### 从源码运行
 
-命令行版连接一个选定的 Codex 会话，收发文字、持续补充，并收到公开进展与回复。
+源码示例演示扫码绑定、固定会话转发和文字回复，供开发者继续扩展。
 
-准备 Node.js 20.19 或更新版本，以及支持本地插件的 Codex 桌面。使用当前桌面对应的原生 `codex` CLI。
+准备 Node.js 20.19 或更新版本，以及支持 WebSocket 或共享服务代理的 Codex 连接入口。
 
 ```sh
 git clone https://github.com/ChinaJohnZhang/kaiby-link.git
@@ -62,14 +62,14 @@ npm ci
 node bin/kaiby-link.cjs login
 ```
 
-扫码后，在仓库目录中安装扩展：
+扫码后，填入已有会话 ID 和连接地址：
 
 ```sh
-codex plugin marketplace add .
-codex plugin add kaiby-link@kaiby-link-source
+node bin/kaiby-link.cjs check --thread YOUR_THREAD_ID --endpoint ws://127.0.0.1:YOUR_PORT
+node bin/kaiby-link.cjs run --thread YOUR_THREAD_ID --endpoint ws://127.0.0.1:YOUR_PORT
 ```
 
-在 Codex 中刷新并启用扩展，再让 Codex 调用 `start_kaiby_link`，把要连接的会话 ID 填入 `threadId`。插件由当前桌面运行，手机消息随即进入该会话。
+运行 `node bin/kaiby-link.cjs --help` 查看共享服务代理等参数。
 
 **让 AI 帮你部署：** 把项目链接交给 AI，并让它先读 [AGENTS.md](AGENTS.md)。环境识别、安装、诊断和收发验证交给 AI，你负责扫码和选择会话。
 

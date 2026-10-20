@@ -189,33 +189,29 @@ class Channel {
   ingest(data, expectedAuth = this.auth()) {
     return this.update(state => {
       this.checkBinding(state, expectedAuth);
-      let added = 0, backpressure = false;
-      let active = state.messages.filter(message => ['pending', 'queued', 'processing'].includes(message.status)).length;
+      let added = 0;
       for (const message of data.msgs || []) {
         if (message.from_user_id !== expectedAuth.owner || message.group_id || message.message_type !== 1
           || (message.to_user_id && message.to_user_id !== expectedAuth.bot)
           || (message.message_state != null && message.message_state !== 2)) continue;
         if (!message.message_id || (typeof message.message_id === 'number' && !Number.isSafeInteger(message.message_id))) continue;
         const id = String(message.message_id);
-        if (state.seen.includes(id) || state.messages.some(message => message.id === id)) continue;
+        if (state.seen.includes(id)) continue;
         const text = (message.item_list || []).filter(x => x.type === 1).map(x => x.text_item?.text || '').join('\n');
         if (!text || !message.context_token) continue;
-        // Keep the old cursor when this batch does not fit yet. Admitted rows
-        // remain durable, and seen IDs skip them when that cursor is pulled
-        // again after the worker frees room. Backpressure is not a poll error.
-        if (active >= 30) { backpressure = true; break; }
+        if (state.messages.filter(x => !['sent', 'handled', 'ignored'].includes(x.status)).length >= 30) {
+          throw new Error('待处理消息已满，保留当前游标，停止接收');
+        }
         state.messages.push({ id, text, context: message.context_token, status: 'pending', received: Date.now() });
         state.lastContext = message.context_token;
-        state.seen.push(id); added++; active++;
+        state.seen.push(id); added++;
       }
-      // Do not discard replay deduplication until the entire cursor batch has
-      // been admitted, even if a large batch needs several passes.
-      if (!backpressure) state.seen = state.seen.slice(-2000);
+      state.seen = state.seen.slice(-2000);
       const recent = state.messages.filter(x => ['sent', 'handled', 'ignored'].includes(x.status)
         && x.received > Date.now() - 86400000).slice(-170);
       state.messages = state.messages.filter(x => !['sent', 'handled', 'ignored'].includes(x.status)).concat(recent);
-      if (!backpressure && typeof data.get_updates_buf === 'string') state.cursor = data.get_updates_buf;
-      return { received: added, pending: state.messages.filter(x => x.status === 'pending').length, ...(backpressure ? { backpressure: true } : {}) };
+      if (typeof data.get_updates_buf === 'string') state.cursor = data.get_updates_buf;
+      return { received: added, pending: state.messages.filter(x => x.status === 'pending').length };
     });
   }
   async poll({ signal } = {}) {

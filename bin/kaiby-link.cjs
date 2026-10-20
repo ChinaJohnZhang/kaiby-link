@@ -14,7 +14,7 @@ async function main() {
   if (values.help || !command) {
     console.log('开摆连接器 · 开源版\nhttps://kaibyai.com\n\nlogin    生成扫码二维码并等待绑定\nrun      连接固定会话，必填 --thread\ncheck    只读检查指定会话连接\nstatus   查看扫码状态\n\n连接现有服务器：--endpoint ws://127.0.0.1:端口\n连接已有共享服务：--mode proxy --codex-path 原生CLI路径\n可选：--codex-home 资料目录 --data-dir 本工具资料目录\n\n不自动接管未开放连接的桌面实例，不创建新会话。'); return;
   }
-  const channel = new Channel({ directory: values['data-dir'] || process.env.KAIBY_LINK_DATA_DIR });
+  const channel = new Channel({ directory: values['data-dir'] });
   if (command === 'status') { console.log(JSON.stringify({ authenticated: Boolean(channel.read('认证')?.token) })); return; }
   if (command === 'login') {
     const result = await channel.beginLogin(); const qr = require('qrcode-generator')(0, 'M'); qr.addData(result.qrText); qr.make();
