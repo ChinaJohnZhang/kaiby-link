@@ -3,7 +3,10 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
 const { PassThrough } = require('node:stream');
-const { extensionLaunch, waitForExit, stopChild, windowsNativeProbeCommand, diagnosticText, failureDiagnostic, failureAnnotation, observeChild } = require('../.github/scripts/basic-smoke.cjs');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { extensionLaunch, waitForExit, stopChild, windowsNativeProbeCommand, assertFixtureDirectory, diagnosticText, failureDiagnostic, failureAnnotation, observeChild } = require('../.github/scripts/basic-smoke.cjs');
 
 test('the Windows extension launcher preserves spaces using cmd outer and executable quotes', () => {
   const launcher = 'C:\\Users\\CI Runner\\Temp\\kaiby basic smoke abc\\launch_kaiby_link_mcp.cmd';
@@ -84,6 +87,28 @@ test('native smoke refuses malformed extraction or a PID that could inject Power
   assert.throws(() => windowsNativeProbeCommand("Add-Type -TypeDefinition @'\npublic class WrongClass {}\n'@", 10));
 });
 
+test('native fixture identity accepts a junction or symlink alias of the exact fixture directory', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kaiby native identity '));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const fixture = path.join(root, 'native handle fixture'), alias = path.join(root, 'fixture alias');
+  fs.mkdirSync(fixture); fs.writeFileSync(path.join(fixture, 'state_99.sqlite'), '');
+  fs.symlinkSync(fixture, alias, process.platform === 'win32' ? 'junction' : 'dir');
+  assert.notEqual(alias, fixture);
+  assert.doesNotThrow(() => assertFixtureDirectory(alias, fixture));
+  assert.doesNotThrow(() => assertFixtureDirectory(fixture, alias));
+});
+
+test('native fixture identity rejects a different directory or an ordinary file', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kaiby native identity '));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const fixture = path.join(root, 'fixture'), other = path.join(root, 'different fixture');
+  fs.mkdirSync(fixture); fs.mkdirSync(other);
+  fs.writeFileSync(path.join(fixture, 'state_99.sqlite'), '');
+  fs.writeFileSync(path.join(other, 'state_99.sqlite'), '');
+  assert.throws(() => assertFixtureDirectory(other, fixture), /different fixture directory identity/);
+  assert.throws(() => assertFixtureDirectory(path.join(fixture, 'state_99.sqlite'), fixture), /not a file/);
+});
+
 test('smoke diagnostics retain compiler errors while redacting credentials, encoded commands and local paths', () => {
   const raw = [
     'Add-Type : error CS1061: fixture native helper failed',
@@ -114,6 +139,9 @@ test('failure diagnostics retain their original stage, native process status and
   assert.match(diagnostic.stderr, /Add-Type : error CS1002/);
   assert.equal(JSON.stringify(diagnostic).includes('fixture-private-token'), false);
   assert.ok(diagnostic.stdout.length <= 1800);
+  const identityFailure = new assert.AssertionError({ message: 'fixture identity mismatch', actual: 111111111111111111n, expected: 222222222222222222n, operator: 'strictEqual' });
+  assert.doesNotThrow(() => JSON.stringify(failureDiagnostic(identityFailure)));
+  assert.equal(failureDiagnostic(identityFailure).actual, '111111111111111111n');
 });
 
 test('assertion arrays and process output diagnostics do not dump fixture paths or access URLs', () => {

@@ -28,6 +28,7 @@ function diagnosticText(value, maximum = 1800) {
   return text.slice(0, maximum);
 }
 function diagnosticValue(value) {
+  if (typeof value === 'bigint') return value.toString() + 'n';
   if (Buffer.isBuffer(value)) return 'Buffer(' + value.length + ' bytes)';
   if (Array.isArray(value)) return 'Array(' + value.length + ')';
   if (value && typeof value === 'object') return 'Object';
@@ -108,6 +109,17 @@ function windowsNativeProbeCommand(helperSource, fixturePid) {
   ].join('\n');
   return { command: 'powershell.exe', args: ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')] };
 }
+function assertFixtureDirectory(actual, expected) {
+  // Windows handles may name the same fixture through an 8.3 path, junction,
+  // or extended path prefix. Resolve both names, then verify filesystem identity
+  // instead of comparing one raw spelling with one canonical spelling.
+  const actualStat = fs.statSync(fs.realpathSync(actual), { bigint: true });
+  const expectedStat = fs.statSync(fs.realpathSync(expected), { bigint: true });
+  assert.ok(actualStat.isDirectory() && expectedStat.isDirectory(), 'Native helper result must be the fixture directory, not a file');
+  assert.notEqual(expectedStat.ino, 0n, 'Fixture directory identity is unavailable');
+  assert.equal(actualStat.dev, expectedStat.dev, 'Native helper returned a different fixture directory device');
+  assert.equal(actualStat.ino, expectedStat.ino, 'Native helper returned a different fixture directory identity');
+}
 function checkWindowsNativeHelper(resources, temp, env) {
   assert.equal(process.platform, 'win32', 'Native helper fixture requires Windows');
   const directory = fs.mkdtempSync(path.join(temp, 'native handle fixture '));
@@ -123,7 +135,7 @@ function checkWindowsNativeHelper(resources, temp, env) {
     assert.ok(Array.isArray(homes), 'Native helper must return a directory array');
     assert.equal(homes.length, 1, 'Native helper must find exactly the fixture directory');
     assert.equal(typeof homes[0], 'string');
-    assert.equal(path.resolve(homes[0]).toLowerCase(), fs.realpathSync(directory).toLowerCase(), 'Native helper returned a different directory');
+    assertFixtureDirectory(homes[0], directory);
   } finally {
     fs.closeSync(fd); fs.rmSync(directory, { recursive: true, force: true });
   }
@@ -288,4 +300,4 @@ if (require.main === module) main().catch(error => {
   console.error('[smoke] FAILED ' + JSON.stringify(failureDiagnostic(error)));
   console.error(failureAnnotation(error)); process.exitCode = 1;
 });
-module.exports = { extensionLaunch, waitForExit, stopChild, checkDesktopExtension, windowsNativeProbeCommand, checkPortableResources, checkWebResources, diagnosticText, failureDiagnostic, failureAnnotation, observeChild };
+module.exports = { extensionLaunch, waitForExit, stopChild, checkDesktopExtension, windowsNativeProbeCommand, assertFixtureDirectory, checkPortableResources, checkWebResources, diagnosticText, failureDiagnostic, failureAnnotation, observeChild };
