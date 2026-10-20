@@ -3,7 +3,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
 const { PassThrough } = require('node:stream');
-const { setImmediate: immediate } = require('node:timers/promises');
+const { setImmediate: immediate, setTimeout: delay } = require('node:timers/promises');
 const { DesktopConnection, sourceOf } = require('../src/desktop.cjs');
 
 const env = { CODEX_THREAD_ID: 'actual-caller', CODEX_APP_TOOLS_PIPE_PATH: '/provided/pipe', CODEX_MCP_NODE_PATH: '/provided/node' };
@@ -382,16 +382,16 @@ test('concurrent unrelated inputs before this steering and in other turns cannot
   assert.equal(await connection.runTurn('thread-1', 'hello'), 'correct steering final');
 });
 
-test('another input inserted after this steering makes a later final ambiguous instead of forwarding it', async () => {
+test('later steering in the same native turn shares its eventual final answer', async () => {
   for (const other of [user('desktop follow-up', 'desktop-input'), delegation('different instruction', 'other-delegation', 'different-source')]) {
     const { connection } = fixture([history(), history([turn('shared-turn', [delegation(), other, publicFinal('cannot attribute this final')])])]);
-    await assert.rejects(connection.runTurn('thread-1', 'hello'), error => error.unknown === true && /其他输入/.test(error.message));
+    assert.equal(await connection.runTurn('thread-1', 'hello'), 'cannot attribute this final');
   }
 });
 
-test('a later unrelated input cannot append its final to a completed own reply segment', async () => {
+test('public answers after accepted steering stay in native turn order', async () => {
   const { connection } = fixture([history(), history([turn('shared-turn', [delegation(), publicFinal('own reply', 'own-final'), user('another task', 'other-user'), publicFinal('other reply', 'other-final')])])]);
-  assert.equal(await connection.runTurn('thread-1', 'hello'), 'own reply');
+  assert.equal(await connection.runTurn('thread-1', 'hello'), 'own reply\n\nother reply');
 });
 
 test('duplicate matching new steering inputs in one existing turn remain unknown', async () => {
@@ -403,4 +403,69 @@ test('read-only recovery also excludes earlier finals in the same steered turn',
   const { connection, calls } = fixture([history([turn('known-turn', [publicFinal('previous final', 'previous-final'), delegation(), publicFinal('steering final', 'steering-final'), user('later task', 'later-input'), publicFinal('later task final', 'later-final')])])]);
   assert.equal(await connection.recoverTurn('thread-1', 'known-turn', 'hello'), 'steering final');
   assert.equal(calls.some(call => call.name === 'send_message_to_thread'), false);
+});
+
+test('accepted steering releases submission order before the shared final and progress stays public and turn-bound', async () => {
+  const { connection } = fixture([history()]);
+  connection.options.turnTimeout = 1000; connection.options.pollInterval = 1;
+  const items = [], progress = []; let sends = 0, completed = false, acceptFirst, acceptSecond;
+  const firstAccepted = new Promise(resolve => { acceptFirst = resolve; });
+  const secondAccepted = new Promise(resolve => { acceptSecond = resolve; });
+  connection._tool = async (name, args) => {
+    if (name === 'send_message_to_thread') { items.push(delegation(args.prompt, 'input-' + ++sends)); return { turnId: 'shared-turn' }; }
+    return history([
+      turn('unrelated-turn', [{ type: 'agentMessage', phase: 'commentary', id: 'other-progress', text: 'never forward other turn' }, publicFinal('wrong turn', 'other-final')]),
+      turn('shared-turn', [...items, ...(completed ? [publicFinal('shared answer', 'shared-final')] : [])], completed ? 'completed' : 'inProgress'),
+    ]);
+  };
+  const options = requestId => ({ requestId, includeResultMetadata: true, onProgress: event => progress.push(event) });
+  const first = connection.runTurn('thread-1', 'hello', acceptFirst, options('mobile-1'));
+  await firstAccepted;
+  assert.equal(connection.turnReserved, false);
+  const second = connection.runTurn('thread-1', 'hello', acceptSecond, options('mobile-2'));
+  await secondAccepted;
+  assert.equal(sends, 2); assert.equal(connection.activeControllers.size, 2);
+  await assert.rejects(connection.runTurn('thread-1', 'hello', undefined, options('mobile-1')), /已经提交/);
+  items.push({ type: 'agentMessage', phase: 'commentary', id: 'public-progress', text: 'Working on it' },
+    { type: 'reasoning', id: 'private-reason', text: 'private reasoning' },
+    { type: 'functionCallOutput', namespace: 'shell', name: 'exec', id: 'private-tool', output: { text: 'private tool output' } });
+  await delay(8);
+  assert.deepEqual(progress, [{ threadId: 'thread-1', turnId: 'shared-turn', itemId: 'public-progress', text: 'Working on it', phase: 'commentary' }]);
+  completed = true;
+  const results = await Promise.all([first, second]);
+  for (const result of results) assert.deepEqual(result, { threadId: 'thread-1', turnId: 'shared-turn', text: 'shared answer', finalItems: [{ itemId: 'shared-final', text: 'shared answer' }] });
+  assert.equal(connection.unknownSubmissions.size, 0);
+  assert.equal(connection.progressSeen.size, 0); assert.equal(connection.progressCollectors.size, 0);
+});
+
+test('disconnect aborts every accepted steering collector and never replays their request IDs', async () => {
+  const { connection } = fixture([history()]);
+  connection.options.turnTimeout = 1000; connection.options.pollInterval = 1;
+  const items = []; let sends = 0;
+  connection._tool = async (name, args) => {
+    if (name === 'send_message_to_thread') { items.push(delegation(args.prompt, 'input-' + ++sends)); return { turnId: 'shared-turn' }; }
+    return history([turn('shared-turn', [...items], 'inProgress')]);
+  };
+  let acceptFirst, acceptSecond;
+  const a = new Promise(resolve => { acceptFirst = resolve; }), b = new Promise(resolve => { acceptSecond = resolve; });
+  const first = connection.runTurn('thread-1', 'one', acceptFirst, { requestId: 'one' }); first.catch(() => {});
+  await a;
+  const second = connection.runTurn('thread-1', 'two', acceptSecond, { requestId: 'two' }); second.catch(() => {});
+  await b; connection.close();
+  for (const result of await Promise.allSettled([first, second])) { assert.equal(result.status, 'rejected'); assert.equal(result.reason.unknown, true); }
+  connection.connected = true;
+  for (const text of ['one', 'two']) await assert.rejects(connection.runTurn('thread-1', text, undefined, { requestId: text }), error => error.unknown === true);
+  assert.equal(sends, 2); assert.equal(connection.activeControllers.size, 0);
+});
+
+test('stop during desktop preflight never submits and proves the queued message is safe to retain', async () => {
+  const { connection, calls } = fixture([history()]);
+  const original = connection._tool; let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  connection._tool = async (name, args) => { if (name === 'read_thread') await gate; return original(name, args); };
+  const running = connection.runTurn('thread-1', 'hello', undefined, { requestId: 'preflight-message' });
+  await immediate(); connection.close(); release();
+  await assert.rejects(running, error => error.notDispatched === true && !error.unknown);
+  assert.equal(calls.filter(call => call.name === 'send_message_to_thread').length, 0);
+  assert.equal(connection.unknownSubmissions.size, 0);
 });

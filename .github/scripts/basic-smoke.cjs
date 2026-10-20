@@ -207,9 +207,11 @@ async function checkDesktopExtension(resources, runtime, env, version, observe =
     child.stdin.write(JSON.stringify({jsonrpc:'2.0',method:'notifications/initialized'})+'\n');
     stage('Desktop extension: MCP tools/list');
     const tools=(await request(2,'tools/list',{})).result.tools;
-    assert.deepEqual(tools.map(t=>t.name),['enable_kaiby_link']);
+    const legacyPreview = /^0\.1\.0-preview\.[1-5]$/.test(version);
+    assert.deepEqual(tools.map(t=>t.name),legacyPreview ? ['enable_kaiby_link'] : ['enable_kaiby_link', 'send_kaiby_message']);
     stage('Desktop extension: reject tools/call without host metadata');
     assert.equal((await request(3,'tools/call',{name:'enable_kaiby_link',arguments:{}})).result.isError,true);
+    if (!legacyPreview) assert.equal((await request(4,'tools/call',{name:'send_kaiby_message',arguments:{text:'portable smoke probe'}})).result.isError,true);
     stage('Desktop extension: clean protocol shutdown');
     child.stdin.end();
     assert.equal(await waitForExit(child), 0, 'MCP exit failed');

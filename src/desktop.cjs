@@ -89,6 +89,13 @@ function publicReply(turn, oldItems, inputIndex) {
   if (!finals.length) return null;
   return finals.map(item => item.text).join('\n\n');
 }
+function publicFinalItems(turn, oldItems, inputIndex) {
+  // Steering inputs share a native turn and therefore its eventual public
+  // answers. A later input does not invalidate the earlier accepted input.
+  const finals = turn.items.slice(inputIndex + 1).filter(item => item.type === 'agentMessage' && item.phase === 'final_answer' && typeof item.text === 'string' && validId(item.id) && !oldItems.has(item.id));
+  if (finals.some(truncated)) throw failure('本轮回复已被桌面读取接口截断，请回 Codex 查看完整内容。', true);
+  return finals.map(item => ({ itemId: item.id, text: item.text }));
+}
 function truncated(item) {
   return item?.truncated === true || item?.isTruncated === true || item?.textTruncated === true ||
     typeof item?.text === 'string' && (item.text.length >= ITEM_LIMIT || /\[(?:[^\]\n]{0,50})truncat(?:ed|ion)[^\]\n]*\]|<truncated>|内容已截断|输出已截断/i.test(item.text));
@@ -99,10 +106,10 @@ function snapshot(data, threadId) {
   for (const turn of turns) if (!validId(turn.id) || !Array.isArray(turn.items)) throw failure('Codex 本轮历史不完整，请回电脑端核对。');
   // read_thread must include outputs to correlate a desktop delegation. Keep
   // only that exact tool's bounded text in memory; all other tool output,
-  // reasoning, progress and tool arguments are discarded at this boundary.
+  // reasoning and tool arguments are discarded at this boundary.
   const filtered = turns.map(turn => ({ id: turn.id, status: turn.status, items: turn.items.flatMap(item => {
     if (item.type === 'userMessage') return [{ id: item.id, type: item.type, content: item.content, truncated: item.truncated, isTruncated: item.isTruncated }];
-    if (item.type === 'agentMessage' && item.phase === 'final_answer') return [{ id: item.id, type: item.type, phase: item.phase, text: item.text, truncated: item.truncated, isTruncated: item.isTruncated, textTruncated: item.textTruncated }];
+    if (item.type === 'agentMessage' && ['commentary', 'final_answer'].includes(item.phase)) return [{ id: item.id, type: item.type, phase: item.phase, text: item.text, truncated: item.truncated, isTruncated: item.isTruncated, textTruncated: item.textTruncated }];
     if (item.type === 'functionCallOutput' && item.name === 'send_message_to_thread' && item.namespace === 'codex_app') return [{ id: item.id, type: item.type, name: item.name, namespace: item.namespace, output: { text: item.output?.text, truncated: item.output?.truncated } }];
     return [];
   }) }));
@@ -117,6 +124,7 @@ class DesktopConnection extends EventEmitter {
     this.unavailableReason = !this.source ? '请先从 Codex 中启用连接器插件，尚未取得真实会话调用来源。' : !this.ready ? '连接器尚未接入 Codex 插件宿主，请在 Codex 中启用。' : null;
     this.connected = false; this.sequence = 0; this.pending = new Map(); this.destinations = new Map(); this.turnReserved = false;
     this.unknownSubmission = null; this.unknownSubmissions = new Map();
+    this.supportsSteering = true; this.activeControllers = new Set(); this.activeSubmissions = new Set(); this.progressSeen = new Map(); this.progressCollectors = new Map();
   }
   async connect() {
     if (this.connected) return;
@@ -216,7 +224,7 @@ class DesktopConnection extends EventEmitter {
     if (reply == null) throw failure('指定输入之后尚无可确认的最终回复，请在 Codex 中核对。');
     return reply;
   }
-  async runTurn(threadId, text, onAccepted = () => {}, { requestId } = {}) {
+  async runTurn(threadId, text, onAccepted = () => {}, { requestId, onProgress, includeResultMetadata = false } = {}) {
     if (typeof text !== 'string' || !text.trim() || text.length > 16000) throw failure('请发送不超过 16000 字的文字消息。');
     if (requestId != null && (typeof requestId !== 'string' || !requestId || requestId.length > 512)) throw failure('消息 ID 无效。');
     // Real inbound IDs isolate retries even when two messages have identical
@@ -225,11 +233,14 @@ class DesktopConnection extends EventEmitter {
     const submissionKey = crypto.createHash('sha256').update(JSON.stringify(requestId == null ? ['text', threadId, text] : ['request', requestId])).digest('hex');
     if (this.unknownSubmissions.has(submissionKey)) throw failure('这条消息已经提交，不会重复发送；你可以继续发送新消息。', true);
     if (this.turnReserved) throw failure('当前正在处理一条消息，请完成后再发送。');
-    this.turnReserved = true;
-    let dispatched = false;
+    if (this.activeSubmissions.has(submissionKey)) throw failure('这条消息已经提交，正在等待回复。', true);
+    const reservation = {}; this.turnReserved = reservation; this.activeSubmissions.add(submissionKey);
+    let dispatched = false, collectorTurnKey = null;
     const controller = new AbortController(); this.activeController = controller;
+    this.activeControllers.add(controller);
     try {
       const before = await this._read(threadId);
+      if (controller.signal.aborted || !this.connected) { const error = failure('连接器已停止，尚未提交的消息已保留。'); error.notDispatched = true; throw error; }
       if (statusOf(before.thread) === 'systemError') throw failure('所选会话暂不可用，请回电脑端处理。');
       const oldItems = new Set(before.turns.flatMap(turn => turn.items.map(item => item.id)).filter(Boolean));
       const envelope = delegationEnvelope(this.source.threadId, text);
@@ -245,8 +256,9 @@ class DesktopConnection extends EventEmitter {
       while (Date.now() < deadline) {
         if (controller.signal.aborted || !this.connected) throw failure('Codex 桌面已断开，请回电脑端核对本轮结果。', true);
         const after = await this._read(threadId);
+        if (controller.signal.aborted || !this.connected) throw failure('Codex 桌面已断开，请回电脑端核对本轮结果。', true);
         const matches = after.turns.flatMap(turn => turn.items.flatMap((item, index) => validId(item.id) && !oldItems.has(item.id) &&
-          (!userId || item.id === userId) && delegatedInput(item, envelope) ? [{ turn, index, inputId: item.id }] : []));
+          (!userId || item.id === userId) && (!matchedInputId || item.id === matchedInputId) && delegatedInput(item, envelope) ? [{ turn, index, inputId: item.id }] : []));
         if (matches.length > 1) throw failure('出现多条相同输入，本轮对应关系无法确认，请回电脑核对。', true);
         const match = matches[0];
         if (match && (turnId && match.turn.id !== turnId || matchedInputId && match.inputId !== matchedInputId)) throw failure('Codex 本轮输入和回执不一致，请回电脑核对。', true);
@@ -255,10 +267,32 @@ class DesktopConnection extends EventEmitter {
         // Even an explicit receipt must be proven by its new input item before
         // any final from that turn can be attributed to this mobile message.
         const turn = match?.turn;
-        if (turn && !announced) { announced = true; await onAccepted(turnId); }
+        if (turn && !announced) {
+          announced = true;
+          collectorTurnKey = JSON.stringify([threadId, turnId]);
+          this.progressCollectors.set(collectorTurnKey, (this.progressCollectors.get(collectorTurnKey) || 0) + 1);
+          if (this.turnReserved === reservation) this.turnReserved = false;
+          await onAccepted(turnId);
+        }
+        if (turn && typeof onProgress === 'function') {
+          for (const item of turn.items.slice(match.index + 1)) {
+            if (item.type !== 'agentMessage' || item.phase !== 'commentary' || !validId(item.id) || typeof item.text !== 'string' || !item.text.trim() || oldItems.has(item.id) || truncated(item)) continue;
+            const key = JSON.stringify([threadId, turnId, item.id]);
+            if (this.progressSeen.has(key)) continue;
+            this.progressSeen.set(key, collectorTurnKey);
+            // Delivery problems must not turn a still-running model request
+            // into a reason to replay it. Its item intent remains durable in
+            // the caller's delivery ledger, and later answers can continue.
+            try { await onProgress({ threadId, turnId, itemId: item.id, text: item.text, phase: 'commentary' }); }
+            catch { this.emit('progressError', { threadId, turnId, itemId: item.id }); }
+          }
+        }
         if (turn?.status === 'completed') {
-          const reply = publicReply(turn, oldItems, match.index);
-          if (reply != null) return reply;
+          const finalItems = publicFinalItems(turn, oldItems, match.index);
+          if (finalItems.length) {
+            const reply = finalItems.map(item => item.text).join('\n\n');
+            return includeResultMetadata ? { threadId, turnId, text: reply, finalItems } : reply;
+          }
         }
         if (turn && ['failed', 'interrupted', 'cancelled'].includes(turn.status)) throw failure('本轮未完成，请回 Codex 查看原因。', true);
         await delay(this.options.pollInterval ?? 1500, undefined, { signal: controller.signal });
@@ -266,17 +300,30 @@ class DesktopConnection extends EventEmitter {
       throw failure('等待本轮回复超时，请回 Codex 核对；不会自动重发。', true);
     } catch (error) {
       const result = error?.name === 'AbortError' ? failure('Codex 桌面连接已停止，请回电脑核对本轮结果。') : error instanceof Error ? error : failure('本轮结果无法确认，请回电脑核对。');
+      if (!dispatched && controller.signal.aborted) result.notDispatched = true;
       if (dispatched) {
         result.unknown = true;
         this.unknownSubmission = { threadId, submissionKey, ...(requestId == null ? {} : { requestId }) };
         this.unknownSubmissions.set(submissionKey, this.unknownSubmission);
       }
       throw result;
-    } finally { if (this.activeController === controller) this.activeController = null; this.turnReserved = false; }
+    } finally {
+      if (this.activeController === controller) this.activeController = null;
+      this.activeControllers.delete(controller); this.activeSubmissions.delete(submissionKey);
+      if (this.turnReserved === reservation) this.turnReserved = false;
+      if (collectorTurnKey) {
+        const remaining = (this.progressCollectors.get(collectorTurnKey) || 1) - 1;
+        if (remaining) this.progressCollectors.set(collectorTurnKey, remaining);
+        else {
+          this.progressCollectors.delete(collectorTurnKey);
+          for (const [key, turnKey] of this.progressSeen) if (turnKey === collectorTurnKey) this.progressSeen.delete(key);
+        }
+      }
+    }
   }
   close() {
     const child = this.transport; this.transport = null; const wasConnected = this.connected; this.connected = false;
-    this.activeController?.abort();
+    for (const controller of this.activeControllers) controller.abort();
     for (const entry of this.pending.values()) { clearTimeout(entry.timer); entry.reject(failure('Codex 桌面连接已中断，请回电脑核对；不会自动重发。', entry.mutation)); }
     this.pending.clear();
     if (child) { try { child.kill(); } catch {} }

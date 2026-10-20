@@ -196,7 +196,7 @@ test('stop preserves queued texts and the next start resumes only those not disp
 });
 
 test('attachment preparation cannot be overtaken by later text or write model intent early', async t => {
-  const f = fixture(t, 'image request'), gate = deferred(), prepared = [], calls = [];
+  const f = fixture(t, 'image request'), gate = deferred(), prepared = [], calls = [], destinations = [];
   f.message.text = '';
   f.message.attachments = [{ type: 'image', file: 'fixture-image' }];
   f.channel.update(state => { state.messages[0].text = ''; state.messages[0].attachments = f.message.attachments; });
@@ -205,7 +205,7 @@ test('attachment preparation cannot be overtaken by later text or write model in
     if (message.id === '1') await gate.promise;
     return { ...message, text: message.id === '1' ? 'image at fixture-local-path' : message.text };
   };
-  f.connection.runTurn = async (_thread, text) => { calls.push(text); return 'done-' + text; };
+  f.connection.runTurn = async (threadId, text) => { destinations.push(threadId); calls.push(text); return 'done-' + text; };
   const first = f.link.handle(f.message);
   const second = f.link.handle(addMessage(f, '2', 'after image'));
   await immediate();
@@ -213,10 +213,14 @@ test('attachment preparation cannot be overtaken by later text or write model in
   assert.deepEqual(calls, []);
   assert.equal(f.channel.read(messageJournalName('1')), null);
   assert.equal(f.channel.read(messageJournalName('2')), null);
+  assert.equal(f.link.activePreparationCount, 1);
+  f.link.selected = { id: 'next-thread', title: 'Changed while preparing' };
   gate.resolve();
   await Promise.all([first, second]);
   assert.deepEqual(prepared, ['1', '2']);
   assert.deepEqual(calls, ['image at fixture-local-path', 'after image']);
+  assert.deepEqual(destinations, ['thread-1', 'next-thread']);
+  assert.equal(f.link.activePreparationCount, 0);
 });
 
 test('a failed attachment preparation affects one message and the following text still completes', async t => {
@@ -415,4 +419,109 @@ test('a durable completed message is not replayed if the inbox row returns to pe
   assert.equal(calls, 1);
   assert.equal(f.channel.state().messages[0].status, 'handled');
   assert.equal(f.channel.read(messageJournalName(f.message.id)).status, 'complete');
+});
+
+test('desktop texts enter an accepted active turn without waiting for its final and share one delivered final', async t => {
+  const f = fixture(t, 'first'), final = deferred(), calls = [];
+  f.connection.supportsSteering = true;
+  f.connection.runTurn = async (threadId, text, accepted, options) => {
+    calls.push({ threadId, text, options }); await accepted('shared-turn');
+    await final.promise;
+    return { threadId, turnId: 'shared-turn', text: 'shared final', finalItems: [{ itemId: 'final-item', text: 'shared final' }] };
+  };
+  const first = f.link.handle(f.message);
+  const second = f.link.handle(addMessage(f, '2', 'second'));
+  const third = f.link.handle(addMessage(f, '3', 'third'));
+  await immediate();
+  assert.deepEqual(calls.map(call => call.text), ['first', 'second', 'third']);
+  assert.equal(f.link.activeModelCount, 3); assert.equal(f.link.busy, true); assert.equal(f.link.queuedCount, 0);
+  for (const id of ['1', '2', '3']) assert.equal(f.channel.read(messageJournalName(id)).status, 'accepted');
+  const progress = { threadId: 'thread-1', turnId: 'shared-turn', itemId: 'progress-item', text: 'Public progress', phase: 'commentary' };
+  await Promise.all([calls[0].options.onProgress(progress), calls[1].options.onProgress(progress)]);
+  assert.deepEqual(f.sent, ['Public progress']);
+  final.resolve(); await Promise.all([first, second, third]);
+  assert.deepEqual(f.sent, ['Public progress', 'shared final']);
+  assert.equal(f.link.busy, false); assert.equal(f.link.activeModelCount, 0);
+  assert.deepEqual(f.channel.state().messages.map(row => row.status), ['handled', 'handled', 'handled']);
+  assert.equal(Object.values(f.channel.state().publicDeliveries).filter(row => row.status === 'complete').length, 2);
+});
+
+test('public delivery skips already sent chunks and never retries an unknown item', async t => {
+  const f = fixture(t);
+  const event = { threadId: 'thread-1', turnId: 'shared-turn', itemId: 'final-item', text: 'sent final', phase: 'final_answer' };
+  await f.link.forwardPublicMessage(event);
+  // Existing channel receipts remain authoritative even after a missing item
+  // audit is reconstructed, e.g. after a write failure at completion.
+  f.channel.update(state => { delete state.publicDeliveries; });
+  await f.link.forwardPublicMessage(event);
+  assert.deepEqual(f.sent, ['sent final']);
+  let attempts = 0;
+  f.channel.sendOwner = async () => { attempts++; throw new Error('ambiguous delivery'); };
+  const unknown = { ...event, itemId: 'unknown-item', text: 'unknown progress', phase: 'commentary' };
+  await assert.rejects(f.link.onProgress(unknown), /ambiguous/);
+  await assert.rejects(f.link.onProgress(unknown), /不会重复发送/);
+  assert.equal(attempts, 1);
+  assert.equal(Object.values(f.channel.state().publicDeliveries).find(row => row.itemId === 'unknown-item').status, 'unknown');
+});
+
+test('a slow public progress delivery stays before a later final from another collector', async t => {
+  const f = fixture(t), progressAck = deferred(), attempts = [];
+  f.channel.sendOwner = async text => { attempts.push(text); if (text === 'progress') await progressAck.promise; return { sent: true }; };
+  const identity = { threadId: 'thread-1', turnId: 'shared-turn' };
+  const progress = f.link.onProgress({ ...identity, itemId: 'progress-item', text: 'progress', phase: 'commentary' });
+  await immediate();
+  const final = f.link.forwardPublicMessage({ ...identity, itemId: 'final-item', text: 'final', phase: 'final_answer' });
+  await immediate();
+  assert.deepEqual(attempts, ['progress']);
+  progressAck.resolve(); await Promise.all([progress, final]);
+  assert.deepEqual(attempts, ['progress', 'final']);
+});
+
+test('completed public delivery audit expires after a day while unknown delivery audit remains', async t => {
+  const f = fixture(t), before = Date.now() - 2 * 86400000;
+  f.channel.update(state => { state.publicDeliveries = {
+    oldComplete: { status: 'complete', at: before }, oldUnknown: { status: 'unknown', at: before }, freshComplete: { status: 'complete', at: Date.now() },
+  }; });
+  await f.link.forwardPublicMessage({ threadId: 'thread-1', turnId: 'shared-turn', itemId: 'new-item', text: 'new public reply', phase: 'final_answer' });
+  const audit = f.channel.state().publicDeliveries;
+  assert.equal(audit.oldComplete, undefined); assert.equal(audit.oldUnknown.status, 'unknown'); assert.equal(audit.freshComplete.status, 'complete');
+});
+
+test('desktop preflight stopped before dispatch is retained and safely submitted on the next start', async t => {
+  const f = fixture(t); longPoll(f); f.connection.supportsSteering = true;
+  const preflight = deferred(); let attempts = 0, submissions = 0;
+  f.connection.runTurn = async (threadId, _text, accepted) => {
+    if (++attempts === 1) return preflight.promise;
+    submissions++; await accepted('resumed-turn');
+    return { threadId, turnId: 'resumed-turn', text: 'resumed reply', finalItems: [{ itemId: 'resumed-final', text: 'resumed reply' }] };
+  };
+  f.connection.close = () => { f.connection.connected = false; const error = new Error('stopped in preflight'); error.notDispatched = true; preflight.reject(error); };
+  await f.link.start();
+  const first = f.link.handle(f.message); await immediate();
+  await f.link.stop(); await first;
+  assert.equal(submissions, 0); assert.equal(f.channel.state().messages[0].status, 'queued');
+  assert.equal(f.channel.read(messageJournalName('1')).status, 'queued');
+  assert.equal(f.channel.read(messageJournalName('1')).stage, 'preflight');
+  await f.link.start(); await f.link.queueWorker; await Promise.allSettled([...f.link.activeMessages]);
+  assert.equal(attempts, 2); assert.equal(submissions, 1);
+  assert.equal(f.channel.state().messages[0].status, 'handled'); assert.deepEqual(f.sent, ['resumed reply']);
+  await f.link.stop();
+});
+
+test('stopping accepted desktop work preserves following unsubmitted attachments and queued text', async t => {
+  const f = fixture(t, 'first'), final = deferred(), preparation = deferred(); longPoll(f);
+  f.connection.supportsSteering = true;
+  const calls = [];
+  f.link.prepareMessage = async message => { if (message.id === '2') await preparation.promise; return message; };
+  f.connection.runTurn = async (_thread, text, accepted) => { calls.push(text); await accepted('shared-turn'); return final.promise; };
+  f.connection.close = () => { f.connection.connected = false; const error = new Error('closed'); error.unknown = true; final.reject(error); };
+  await f.link.start();
+  const first = f.link.handle(f.message), second = f.link.handle(addMessage(f, '2', 'preparing attachment')), third = f.link.handle(addMessage(f, '3', 'third'));
+  await immediate();
+  assert.deepEqual(calls, ['first']);
+  await f.link.stop(); await Promise.all([first, second, third]);
+  assert.deepEqual(f.channel.state().messages.map(row => row.status), ['unknown', 'queued', 'queued']);
+  assert.equal(f.channel.read(messageJournalName('2')), null); assert.equal(f.channel.read(messageJournalName('3')), null);
+  preparation.resolve(); await immediate();
+  assert.deepEqual(calls, ['first']);
 });

@@ -22,6 +22,7 @@ class Link extends EventEmitter {
     this.running = false; this.busy = false; this.error = null; this.selected = null;
     this.loop = null; this.handlers = new Set(); this.controller = null; this.stopping = null;
     this.messageQueue = []; this.queuedMessages = new Map(); this.queueWorker = null; this.queuePaused = false; this.queueController = new AbortController();
+    this.activeMessages = new Set(); this.activeModelCount = 0; this.activePreparationCount = 0; this.publicDeliveryPromises = new Map(); this.publicTurnQueues = new Map();
     this.codex.on('approval', entry => { this.emit('approval', entry); });
     this.codex.on('disconnected', () => { if (this.running) this.error = 'Codex 已断开，请停止连接后重新连接；消息不会自动重发。'; this.emit('state'); });
   }
@@ -57,6 +58,7 @@ class Link extends EventEmitter {
       // for this promise, so a late poll can never stop or unlock the new run.
       this.running = false; controller.abort(); this.pauseQueue(); this.codex.close();
       if (this.queueWorker) await this.queueWorker;
+      await Promise.allSettled([...this.activeMessages]);
       await Promise.allSettled([...this.handlers]);
       this.unlock(); this.controller = null; this.loop = null; this.emit('state');
     });
@@ -69,7 +71,9 @@ class Link extends EventEmitter {
     if (messageId === undefined) return;
     const current = this.channel.read(messageJournalName(messageId));
     const legacy = [this.channel.read(taskJournalName(threadId)), this.channel.read('连接任务')];
-    const prior = current || legacy.find(entry => entry?.messageId === messageId);
+    // Only an explicit adapter proof of "stopped before dispatch" is resumable;
+    // an accepted, sending or unknown request is never made retryable here.
+    const prior = (current?.status === 'queued' && current.stage === 'preflight' ? null : current) || legacy.find(entry => entry?.messageId === messageId);
     if (prior) {
       const error = new Error(prior.status === 'complete' ? '这条消息已经处理完成。' : '这条消息已经提交，不会重复发送；你可以继续发送新消息。');
       error.previouslyHandled = prior.status === 'complete';
@@ -95,6 +99,7 @@ class Link extends EventEmitter {
       this.running = false; this.controller?.abort(); this.pauseQueue(); this.codex.close();
       if (this.loop) await this.loop;
       if (this.queueWorker) await this.queueWorker;
+      await Promise.allSettled([...this.activeMessages]);
       await Promise.allSettled([...this.handlers]);
       this.unlock(); this.emit('state');
     })();
@@ -129,6 +134,9 @@ class Link extends EventEmitter {
     const chars = Array.from(text || '本轮已结束，没有可转发的文字回复，请回电脑端查看。');
     for (let n = 0; n < chars.length; n += 3500) {
       if (this.controller?.signal.aborted) { const error = new Error('连接器已停止，发送结果请回电脑核对。'); error.unknown = true; throw error; }
+      const receipt = this.channel.state().outbound?.[key + '-' + n];
+      if (receipt?.status === 'sent') continue;
+      if (receipt) { const error = new Error('这条回复的发送结果待确认，不会重复发送。'); error.unknown = true; throw error; }
       await this.channel.sendOwner(chars.slice(n, n + 3500).join(''), key + '-' + n);
     }
   }
@@ -166,15 +174,23 @@ class Link extends EventEmitter {
           this.error = 'Codex 已断开，排队消息已保留，重新连接后继续。'; this.emit('state'); break;
         }
         const entry = this.messageQueue.shift();
-        try {
-          await this.runMessage(entry.message);
-          // Enhanced editions may finish a queued session switch here. It must
-          // complete before the next text resolves its destination.
+        let accepted;
+        const ready = new Promise(resolve => { accepted = resolve; });
+        const completion = this.runMessage(entry.message, accepted).then(async () => {
+          // Enhanced editions can apply a pending switch when the shared turn's
+          // collectors and attachment preparation have all finished. Accepted
+          // desktop steering may already be running against its fixed thread.
           if (!this.queuePaused && !this.controller?.signal.aborted) await this.afterMessage();
+          this.queuedMessages.delete(entry.message.id);
           entry.resolve();
-        } catch (error) {
-          this.error = error.message; this.emit('state'); entry.reject(error);
-        } finally { this.queuedMessages.delete(entry.message.id); }
+        }).catch(error => {
+          this.error = error.message; this.emit('state'); this.queuedMessages.delete(entry.message.id); entry.reject(error);
+        }).finally(() => { this.queuedMessages.delete(entry.message.id); this.activeMessages.delete(completion); });
+        this.activeMessages.add(completion);
+        // The desktop can steer an accepted native turn immediately. Legacy
+        // connections retain their original one-complete-turn-at-a-time mode.
+        if (this.codex.supportsSteering) await Promise.race([ready, completion]);
+        else await completion;
       }
     })();
     this.queueWorker = worker;
@@ -184,6 +200,43 @@ class Link extends EventEmitter {
     }).catch(() => {});
   }
   async afterMessage() {}
+  async onProgress(event) { return this.forwardPublicMessage(event); }
+  async forwardPublicMessage(event) {
+    if (!event || !['commentary', 'final_answer'].includes(event.phase) || ![event.threadId, event.turnId, event.itemId].every(value => typeof value === 'string' && value.length > 0 && value.length <= 200) || typeof event.text !== 'string') throw new Error('公开消息身份不完整，未发送。');
+    const key = 'public-' + crypto.createHash('sha256').update(JSON.stringify([event.threadId, event.turnId, event.itemId])).digest('hex');
+    const turnKey = JSON.stringify([event.threadId, event.turnId]);
+    const existing = this.publicDeliveryPromises.get(key);
+    if (existing) return existing;
+    const previousDelivery = this.publicTurnQueues.get(turnKey) || Promise.resolve();
+    const delivery = previousDelivery.catch(() => {}).then(async () => {
+      let skip = false;
+      this.channel.update(state => {
+        state.publicDeliveries ||= {};
+        for (const [name, record] of Object.entries(state.publicDeliveries)) {
+          if (record.status === 'complete' && record.at < Date.now() - 86400000) delete state.publicDeliveries[name];
+        }
+        const previous = state.publicDeliveries[key];
+        if (previous?.status === 'complete') { skip = true; return; }
+        if (previous) { const error = new Error('这条公开回复的发送结果待确认，不会重复发送。'); error.unknown = true; throw error; }
+        state.publicDeliveries[key] = { threadId: event.threadId, turnId: event.turnId, itemId: event.itemId, phase: event.phase, status: 'sending', at: Date.now() };
+      });
+      if (skip) return;
+      try {
+        await this.send(event.text, key);
+        this.channel.update(state => { if (state.publicDeliveries?.[key]) { state.publicDeliveries[key].status = 'complete'; state.publicDeliveries[key].at = Date.now(); } });
+      } catch (error) {
+        this.channel.update(state => { if (state.publicDeliveries?.[key]) state.publicDeliveries[key].status = 'unknown'; });
+        throw error;
+      }
+    });
+    this.publicDeliveryPromises.set(key, delivery);
+    this.publicTurnQueues.set(turnKey, delivery);
+    try { return await delivery; }
+    finally {
+      if (this.publicDeliveryPromises.get(key) === delivery) this.publicDeliveryPromises.delete(key);
+      if (this.publicTurnQueues.get(turnKey) === delivery) this.publicTurnQueues.delete(turnKey);
+    }
+  }
   async prepareMessage(message) { return message; }
   async prepareQueuedMessage(message) {
     const signal = this.queueController.signal;
@@ -195,13 +248,15 @@ class Link extends EventEmitter {
     try { return await Promise.race([Promise.resolve().then(() => { signal.throwIfAborted(); return this.prepareMessage(message, { signal }); }), cancelled]); }
     finally { signal.removeEventListener('abort', onAbort); }
   }
-  async runMessage(message) {
+  async runMessage(message, accepted = () => {}) {
     let claimed = false;
     this.channel.update(state => {
       const row = state.messages.find(item => item.id === message.id);
       if (row?.status === 'queued') { row.status = 'processing'; claimed = true; }
     });
     if (!claimed) return;
+    const threadId = this.selected.id;
+    this.activePreparationCount++; this.emit('state');
     let prepared;
     try {
       prepared = await this.prepareQueuedMessage(message);
@@ -215,21 +270,20 @@ class Link extends EventEmitter {
         // An unreadable attachment affects only its own message. Keep a bounded
         // audit without paths, tokens or exception text, then continue the queue.
         const journal = messageJournalName(message.id);
-        if (!this.channel.read(journal)) this.channel.save(journal, { messageId: message.id, threadId: this.selected?.id || null, status: 'failed', stage: 'prepare', at: Date.now() });
+        if (!this.channel.read(journal)) this.channel.save(journal, { messageId: message.id, threadId, status: 'failed', stage: 'prepare', at: Date.now() });
         this.channel.markHandled(message.id);
         this.error = '这条消息暂时无法读取，请重新发送。后续消息会继续处理。';
         try { await this.send(this.error, 'prepare-failure-' + message.id); } catch {}
       }
       this.emit('state'); return;
-    }
+    } finally { this.activePreparationCount--; this.emit('state'); }
     const text = typeof prepared?.text === 'string' ? prepared.text.trim() : '';
     if (!text || text.length > 16000) {
       await this.send('请发送不超过 16000 字的文字消息。', 'size-' + message.id);
       this.channel.markHandled(message.id); return;
     }
-    this.busy = true; this.emit('state');
+    this.activeModelCount++; this.busy = this.activeModelCount > 0; this.emit('state');
     let submitted = false, callbackAccepted = false;
-    const threadId = this.selected.id;
     const journal = messageJournalName(message.id);
     try {
       this.assertTaskReady(threadId, message.id);
@@ -239,17 +293,29 @@ class Link extends EventEmitter {
       const reply = await this.codex.runTurn(threadId, prepared.text, turnId => {
         callbackAccepted = true;
         this.channel.save(journal, { messageId: message.id, threadId, turnId, status: 'accepted', at: Date.now() });
-      }, { requestId: message.id });
-      await this.send(reply, 'reply-' + message.id);
+        accepted();
+      }, { requestId: message.id, ...(this.codex.supportsSteering ? { includeResultMetadata: true, onProgress: event => {
+        if (event.threadId !== threadId) throw new Error('公开进展与绑定会话不一致。');
+        return this.onProgress(event);
+      } } : {}) });
+      if (this.codex.supportsSteering && Array.isArray(reply?.finalItems)) {
+        if (reply.threadId !== threadId) throw new Error('公开回复与绑定会话不一致。');
+        for (const item of reply.finalItems) await this.forwardPublicMessage({ threadId, turnId: reply.turnId, itemId: item.itemId, text: item.text, phase: 'final_answer' });
+      } else await this.send(reply, 'reply-' + message.id);
       this.channel.markHandled(message.id);
       this.channel.save(journal, { messageId: message.id, threadId, status: 'complete', at: Date.now() });
       this.error = null;
     } catch (error) {
+      if (error.notDispatched && (this.queuePaused || this.queueController.signal.aborted || this.controller?.signal.aborted)) {
+        this.channel.update(state => { const row = state.messages.find(item => item.id === message.id); if (row) row.status = 'queued'; });
+        this.channel.save(journal, { messageId: message.id, threadId, status: 'queued', stage: 'preflight', at: Date.now() });
+        return;
+      }
       this.error = error.message;
       this.channel.update(s => { const row = s.messages.find(x => x.id === message.id); if (row) row.status = error.previouslyHandled ? 'handled' : 'unknown'; });
       if (submitted) this.channel.save(journal, { ...this.channel.read(journal), status: error.unknown || callbackAccepted ? 'unknown' : 'failed', at: Date.now() });
       try { await this.send('未能完成：' + error.message, 'failure-' + message.id); } catch {}
-    } finally { this.busy = false; this.emit('state'); }
+    } finally { this.activeModelCount--; this.busy = this.activeModelCount > 0; this.emit('state'); }
   }
 }
 module.exports = { Link, taskJournalName, messageJournalName };
